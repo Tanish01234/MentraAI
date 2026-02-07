@@ -1,0 +1,228 @@
+import { NextRequest, NextResponse } from 'next/server'
+import { GoogleGenerativeAI } from '@google/generative-ai'
+import { getGroqStructuredCompletion, isGroqAvailable, type GroqMessage } from '@/lib/groq'
+
+export async function POST(request: NextRequest) {
+    try {
+        const body = await request.json()
+
+        // Support both old format (topic) and new format (exam context)
+        const { topic, difficulty, count, language, examName, subjects } = body
+
+        // Check if this is an exam-based quiz or standalone quiz
+        const isExamQuiz = examName && subjects && Array.isArray(subjects)
+
+        if (!isExamQuiz && !topic) {
+            return NextResponse.json({ error: 'Topic or exam details required' }, { status: 400 })
+        }
+
+        const apiKey = process.env.GEMINI_API_KEY?.trim()
+        if (!apiKey && !isGroqAvailable()) {
+            return NextResponse.json({ error: 'No AI API configured' }, { status: 500 })
+        }
+
+        let quizData
+
+        if (isExamQuiz) {
+            // Generate exam-based quiz with multiple subjects
+            const sections = []
+
+            for (const subject of subjects) {
+                const prompt = `Generate exactly 20 multiple-choice quiz questions for ${subject} 
+for ${examName} exam at ${difficulty || 'medium'} difficulty level.
+
+Language: ${language || 'English'}
+
+IMPORTANT: You MUST respond in ${language || 'English'} language only.
+
+Return ONLY valid JSON in this exact format:
+{
+  "questions": [
+    {
+      "question": "Question text in ${language || 'English'}",
+      "options": ["Option A", "Option B", "Option C", "Option D"],
+      "correctIndex": 0,
+      "explanation": "Why this is correct in ${language || 'English'}",
+      "difficulty": "easy|medium|hard"
+    }
+  ]
+}
+
+Rules:
+- Generate EXACTLY 20 questions
+- Cover entire ${subject} syllabus for ${examName}
+- Make questions educational and exam-relevant
+- Options should be plausible
+- Explanation should teach the concept
+- Use ${language || 'English'} language consistently
+- Return ONLY the JSON, no markdown or extra text`
+
+                let subjectQuiz
+
+                // Try Gemini first
+                if (apiKey) {
+                    try {
+                        const genAI = new GoogleGenerativeAI(apiKey)
+                        const model = genAI.getGenerativeModel({
+                            model: 'gemini-1.5-flash',
+                            generationConfig: {
+                                responseMimeType: "application/json"
+                            }
+                        })
+
+                        const result = await model.generateContent(prompt)
+                        const response = result.response
+                        const text = response.text()
+                        subjectQuiz = JSON.parse(text)
+                    } catch (geminiError) {
+                        console.error(`Gemini failed for ${subject}, trying Groq...`, geminiError)
+
+                        // Fallback to Groq
+                        if (isGroqAvailable()) {
+                            const groqMessages: GroqMessage[] = [
+                                { role: 'system', content: 'You are a quiz generator. Return only valid JSON.' },
+                                { role: 'user', content: prompt }
+                            ]
+                            subjectQuiz = await getGroqStructuredCompletion(groqMessages, { max_tokens: 3000 })
+                        } else {
+                            throw geminiError
+                        }
+                    }
+                } else {
+                    // Use Groq directly
+                    const groqMessages: GroqMessage[] = [
+                        { role: 'system', content: 'You are a quiz generator. Return only valid JSON.' },
+                        { role: 'user', content: prompt }
+                    ]
+                    subjectQuiz = await getGroqStructuredCompletion(groqMessages, { max_tokens: 3000 })
+                }
+
+                // Validate structure
+                if (!subjectQuiz.questions || !Array.isArray(subjectQuiz.questions)) {
+                    throw new Error(`Invalid quiz structure for ${subject}`)
+                }
+
+                // Validate each question
+                subjectQuiz.questions.forEach((q: any, idx: number) => {
+                    if (!q.question || !Array.isArray(q.options) || q.options.length !== 4 ||
+                        typeof q.correctIndex !== 'number' || !q.explanation) {
+                        throw new Error(`Invalid question structure in ${subject} at index ${idx}`)
+                    }
+                })
+
+                sections.push({
+                    subject,
+                    questions: subjectQuiz.questions
+                })
+            }
+
+            quizData = {
+                examName,
+                totalQuestions: sections.reduce((sum, s) => sum + s.questions.length, 0),
+                sections
+            }
+
+        } else {
+            // Generate standalone quiz (old format)
+            const prompt = `Generate ${count || 5} multiple-choice quiz questions on the topic: ${topic}
+
+Difficulty level: ${difficulty || 'medium'}
+Language: ${language || 'Hinglish'}
+
+IMPORTANT: You MUST respond in ${language || 'Hinglish'} language only.
+
+Return ONLY valid JSON in this exact format:
+{
+  "questions": [
+    {
+      "question": "Question text in ${language}",
+      "options": ["Option A", "Option B", "Option C", "Option D"],
+      "correctIndex": 0,
+      "explanation": "Why this is correct in ${language}",
+      "difficulty": "easy|medium|hard"
+    }
+  ]
+}
+
+Rules:
+- Make questions educational and clear
+- Options should be plausible
+- Explanation should teach the concept
+- Difficulty should match student level
+- Use ${language} language consistently
+- Return ONLY the JSON, no markdown or extra text`
+
+            // Try Gemini first
+            if (apiKey) {
+                try {
+                    const genAI = new GoogleGenerativeAI(apiKey)
+                    const model = genAI.getGenerativeModel({
+                        model: 'gemini-1.5-flash',
+                        generationConfig: {
+                            responseMimeType: "application/json"
+                        }
+                    })
+
+                    const result = await model.generateContent(prompt)
+                    const response = result.response
+                    const text = response.text()
+                    quizData = JSON.parse(text)
+                } catch (geminiError) {
+                    console.error('Gemini failed, trying Groq...', geminiError)
+
+                    // Fallback to Groq
+                    if (isGroqAvailable()) {
+                        const groqMessages: GroqMessage[] = [
+                            { role: 'system', content: 'You are a quiz generator. Return only valid JSON.' },
+                            { role: 'user', content: prompt }
+                        ]
+                        quizData = await getGroqStructuredCompletion(groqMessages, { max_tokens: 2000 })
+                    } else {
+                        throw geminiError
+                    }
+                }
+            } else {
+                // Use Groq directly
+                const groqMessages: GroqMessage[] = [
+                    { role: 'system', content: 'You are a quiz generator. Return only valid JSON.' },
+                    { role: 'user', content: prompt }
+                ]
+                quizData = await getGroqStructuredCompletion(groqMessages, { max_tokens: 2000 })
+            }
+
+            // Validate structure
+            if (!quizData.questions || !Array.isArray(quizData.questions)) {
+                throw new Error('Invalid quiz structure')
+            }
+
+            // Validate each question
+            quizData.questions.forEach((q: any, idx: number) => {
+                if (!q.question || !Array.isArray(q.options) || q.options.length !== 4 ||
+                    typeof q.correctIndex !== 'number' || !q.explanation) {
+                    throw new Error(`Invalid question structure at index ${idx}`)
+                }
+            })
+        }
+
+        return NextResponse.json({
+            success: true,
+            quiz: quizData,
+            metadata: {
+                isExamQuiz,
+                examName: examName || null,
+                subjects: subjects || null,
+                topic: topic || null,
+                difficulty: difficulty || 'medium',
+                questionCount: isExamQuiz ? quizData.totalQuestions : quizData.questions.length,
+                language: language || 'English'
+            }
+        })
+
+    } catch (error: any) {
+        console.error('Quiz generation error:', error)
+        return NextResponse.json(
+            { error: error.message || 'Failed to generate quiz' },
+            { status: 500 }
+        )
+    }
+}
